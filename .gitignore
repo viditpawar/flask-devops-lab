@@ -1,0 +1,24 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Local environment files
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local tooling/temp artifacts
+.tmp*/
+pytest-cache-files-*/
+.virtualenv-app-data/
+html-coverage/
+coverage.xml
+test-results.xml

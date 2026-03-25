@@ -1,0 +1,276 @@
+name: Python DevOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build_test_lint:
+    name: Build, Test & Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Lint with flake8
+        run: |
+          flake8 app.py config.py routes utils.py tests --max-line-length=127
+
+      - name: Security scan with Bandit
+        continue-on-error: true
+        run: |
+          bandit -r app.py config.py routes utils.py -f txt
+
+      - name: Dependency scan with pip-audit
+        continue-on-error: true
+        run: |
+          pip-audit --desc
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --junitxml=test-results.xml \
+            --cov=. \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term \
+            -v
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  build_docker_image:
+    name: Build & Push Docker Image
+    needs: build_test_lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.image_meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: image_meta
+        run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image_meta.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy_staging:
+    name: Deploy to Staging
+    needs: build_docker_image
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+    env:
+      AZURE_CREDENTIALS: ${{ secrets['AZURE_CREDENTIALS'] }}
+      RESOURCE_GROUP: rg-python-devops-staging
+      LOCATION: eastus
+      APP_NAME: python-devops-ref-app
+      IMAGE_REPOSITORY: python-devops-ref-app
+      IMAGE_TAG: ${{ needs.build_docker_image.outputs.image_tag }}
+      STAGING_API_KEY: ${{ secrets['STAGING_API_KEY'] }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check deployment prerequisites
+        id: precheck
+        shell: bash
+        run: |
+          if [ -z "${AZURE_CREDENTIALS:-}" ]; then
+            echo "skip_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "AZURE_CREDENTIALS is not set. Skipping staging deployment."
+          else
+            echo "skip_deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Azure login
+        if: steps.precheck.outputs.skip_deploy != 'true'
+        uses: azure/login@v2
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Deploy staging infrastructure and app
+        if: steps.precheck.outputs.skip_deploy != 'true'
+        run: |
+          set -euo pipefail
+
+          RESOURCE_GROUP="${RESOURCE_GROUP:-rg-python-devops-staging}"
+          LOCATION="${LOCATION:-eastus}"
+          APP_NAME="${APP_NAME:-python-devops-ref-app}"
+          IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-python-devops-ref-app}"
+          IMAGE_TAG="${IMAGE_TAG:-${GITHUB_SHA}}"
+          ENV_NAME="staging"
+          APP_SERVICE_NAME="${APP_NAME}-app-${ENV_NAME}"
+
+          az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infrastructure/main.bicep \
+            --parameters @infrastructure/parameters.staging.bicepparam \
+            --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+          ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+          if [ -z "$ACR_NAME" ]; then
+            echo "No Azure Container Registry found in $RESOURCE_GROUP"
+            exit 1
+          fi
+
+          az acr build --registry "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infrastructure/main.bicep \
+            --parameters @infrastructure/parameters.staging.bicepparam \
+            --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+          if [ -n "${STAGING_API_KEY:-}" ]; then
+            az webapp config appsettings set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_SERVICE_NAME" \
+              --settings VALID_API_KEY="$STAGING_API_KEY"
+          fi
+
+          APP_HOST=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$APP_SERVICE_NAME" --query "defaultHostName" -o tsv)
+          curl --fail --silent --show-error "https://${APP_HOST}/health"
+
+  deploy_production:
+    name: Deploy to Production
+    needs: deploy_staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    env:
+      AZURE_CREDENTIALS: ${{ secrets['AZURE_CREDENTIALS'] }}
+      RESOURCE_GROUP: rg-python-devops-prod
+      LOCATION: eastus
+      APP_NAME: python-devops-ref-app
+      IMAGE_REPOSITORY: python-devops-ref-app
+      IMAGE_TAG: ${{ github.sha }}
+      PRODUCTION_API_KEY: ${{ secrets['PRODUCTION_API_KEY'] }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check deployment prerequisites
+        id: precheck
+        shell: bash
+        run: |
+          if [ -z "${AZURE_CREDENTIALS:-}" ]; then
+            echo "skip_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "AZURE_CREDENTIALS is not set. Skipping production deployment."
+          else
+            echo "skip_deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Azure login
+        if: steps.precheck.outputs.skip_deploy != 'true'
+        uses: azure/login@v2
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Deploy production infrastructure and app
+        if: steps.precheck.outputs.skip_deploy != 'true'
+        run: |
+          set -euo pipefail
+
+          RESOURCE_GROUP="${RESOURCE_GROUP:-rg-python-devops-prod}"
+          LOCATION="${LOCATION:-eastus}"
+          APP_NAME="${APP_NAME:-python-devops-ref-app}"
+          IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-python-devops-ref-app}"
+          IMAGE_TAG="${IMAGE_TAG:-${GITHUB_SHA}}"
+          ENV_NAME="prod"
+          APP_SERVICE_NAME="${APP_NAME}-app-${ENV_NAME}"
+
+          az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infrastructure/main.bicep \
+            --parameters @infrastructure/parameters.prod.bicepparam \
+            --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+          ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+          if [ -z "$ACR_NAME" ]; then
+            echo "No Azure Container Registry found in $RESOURCE_GROUP"
+            exit 1
+          fi
+
+          az acr build --registry "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infrastructure/main.bicep \
+            --parameters @infrastructure/parameters.prod.bicepparam \
+            --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+          if [ -n "${PRODUCTION_API_KEY:-}" ]; then
+            az webapp config appsettings set \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_SERVICE_NAME" \
+              --settings VALID_API_KEY="$PRODUCTION_API_KEY"
+          fi
+
+          APP_HOST=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$APP_SERVICE_NAME" --query "defaultHostName" -o tsv)
+          curl --fail --silent --show-error "https://${APP_HOST}/health"

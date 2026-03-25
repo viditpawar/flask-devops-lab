@@ -1,4 +1,14 @@
 flask
+flask-limiter
 gunicorn
 pytest
+pytest-cov
 flake8
+bandit
+pip-audit
+python-dotenv
+pydantic>=2,<3
+applicationinsights
+requests
+pyjwt
+psutil

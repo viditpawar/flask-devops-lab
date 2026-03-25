@@ -2,77 +2,257 @@ trigger:
   branches:
     include:
       - main
+      - develop
 
 pr:
   branches:
     include:
       - main
+      - develop
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: "ubuntu-latest"
 
 variables:
-  pythonVersion: '3.11'
-  imageRepository: 'viditpawar/azure-devops-python-cicd'
-  dockerRegistryServiceConnection: 'dockerhub-connection'
-  tag: '$(Build.BuildId)'
+  pythonVersion: "3.11"
+  imageRepository: "viditpawar/azure-devops-python-cicd"
+  dockerRegistryServiceConnection: "dockerhub-connection"
+  tag: "$(Build.BuildId)"
+  azureServiceConnection: "replace-with-azure-service-connection"
+  runDeployments: "false"
+  azureLocation: "eastus"
+  appName: "python-devops-ref-app"
+  stagingResourceGroup: "rg-python-devops-staging"
+  productionResourceGroup: "rg-python-devops-prod"
+  acrImageRepository: "python-devops-ref-app"
 
 stages:
   - stage: BuildAndTest
     displayName: "Build & Test"
     jobs:
-      - job: Build
-        displayName: "Run tests and lint"
+      - job: BuildTestLint
+        displayName: "Build, Test, and Lint Code"
         steps:
-
           - checkout: self
             displayName: "Checkout code"
+            fetchDepth: 0
 
           - task: UsePythonVersion@0
             displayName: "Set Python version"
             inputs:
-              versionSpec: '$(pythonVersion)'
+              versionSpec: "$(pythonVersion)"
 
           - script: |
-              python -m pip install --upgrade pip
+              python -m pip install --upgrade pip setuptools wheel
               pip install -r requirements.txt
             displayName: "Install dependencies"
 
           - script: |
-              pip install pytest flake8
-              flake8 .
-            displayName: "Run flake8"
+              flake8 app.py config.py routes utils.py tests --max-line-length=127
+            displayName: "Run flake8 linting"
 
           - script: |
-              pytest --junitxml=test-results.xml
-            displayName: "Run pytest"
+              bandit -r app.py config.py routes utils.py -f txt || true
+            displayName: "Run Bandit security scan"
+            continueOnError: true
+
+          - script: |
+              pip-audit --desc || true
+            displayName: "Run pip-audit dependency scan"
+            continueOnError: true
+
+          - script: |
+              pytest tests/ \
+                --junitxml=test-results.xml \
+                --cov=. \
+                --cov-report=xml:coverage.xml \
+                --cov-report=html:html-coverage \
+                --cov-report=term \
+                -v
+            displayName: "Run pytest with coverage"
 
           - task: PublishTestResults@2
             displayName: "Publish test results"
+            condition: succeededOrFailed()
             inputs:
-              testResultsFiles: 'test-results.xml'
-              testResultsFormat: 'JUnit'
-              testResultsTitle: 'Python tests'
+              testResultsFiles: "test-results.xml"
+              testResultsFormat: "JUnit"
+              testResultsTitle: "Python Unit Tests"
+              searchFolder: "$(System.DefaultWorkingDirectory)"
+
+          - task: PublishCodeCoverageResults@1
+            displayName: "Publish code coverage"
+            condition: succeededOrFailed()
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: "coverage.xml"
+              failIfCoverageEmpty: false
 
   - stage: BuildAndPushImage
-    displayName: "Build & Push Docker image"
+    displayName: "Build & Push Docker Image"
     dependsOn: BuildAndTest
     condition: succeeded()
     jobs:
       - job: DockerBuild
-        displayName: "Build and push image"
+        displayName: "Build and push Docker image"
         steps:
-
           - checkout: self
             displayName: "Checkout code"
 
           - task: Docker@2
-            displayName: "Build and push to Docker Hub"
+            displayName: "Build Docker image"
             inputs:
-              containerRegistry: '$(dockerRegistryServiceConnection)'
-              repository: '$(imageRepository)'
-              command: 'buildAndPush'
-              Dockerfile: '**/Dockerfile'
+              containerRegistry: "$(dockerRegistryServiceConnection)"
+              repository: "$(imageRepository)"
+              command: "build"
+              Dockerfile: "**/Dockerfile"
               tags: |
                 $(tag)
                 latest
+
+          - task: Docker@2
+            displayName: "Push Docker image"
+            inputs:
+              containerRegistry: "$(dockerRegistryServiceConnection)"
+              repository: "$(imageRepository)"
+              command: "push"
+              tags: |
+                $(tag)
+                latest
+
+  - stage: DeployStaging
+    displayName: "Deploy to Staging"
+    dependsOn: BuildAndPushImage
+    condition: and(
+      succeeded(),
+      eq(variables['runDeployments'], 'true'),
+      ne(variables['azureServiceConnection'], ''),
+      ne(variables['azureServiceConnection'], 'replace-with-azure-service-connection')
+      )
+    jobs:
+      - job: DeployToStaging
+        displayName: "Deploy infrastructure and app to staging"
+        steps:
+          - checkout: self
+            displayName: "Checkout code"
+
+          - task: AzureCLI@2
+            displayName: "Deploy staging with Bicep and ACR build"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RESOURCE_GROUP="$(stagingResourceGroup)"
+                LOCATION="$(azureLocation)"
+                APP_NAME="$(appName)"
+                IMAGE_REPOSITORY="$(acrImageRepository)"
+                IMAGE_TAG="$(tag)"
+                ENV_NAME="staging"
+                APP_SERVICE_NAME="${APP_NAME}-app-${ENV_NAME}"
+
+                az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+                az deployment group create \
+                  --resource-group "$RESOURCE_GROUP" \
+                  --template-file infrastructure/main.bicep \
+                  --parameters @infrastructure/parameters.staging.bicepparam \
+                  --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+                ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+                if [ -z "$ACR_NAME" ]; then
+                  echo "No Azure Container Registry found in $RESOURCE_GROUP"
+                  exit 1
+                fi
+
+                az acr build --registry "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+
+                az deployment group create \
+                  --resource-group "$RESOURCE_GROUP" \
+                  --template-file infrastructure/main.bicep \
+                  --parameters @infrastructure/parameters.staging.bicepparam \
+                  --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+                APP_HOST=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$APP_SERVICE_NAME" --query "defaultHostName" -o tsv)
+                curl --fail --silent --show-error "https://${APP_HOST}/health"
+
+  - stage: ApprovalGate
+    displayName: "Approval for Production"
+    dependsOn: DeployStaging
+    condition: and(
+      succeeded(),
+      eq(variables['runDeployments'], 'true'),
+      ne(variables['azureServiceConnection'], ''),
+      ne(variables['azureServiceConnection'], 'replace-with-azure-service-connection')
+      )
+    jobs:
+      - job: waitForValidation
+        displayName: "Wait for production approval"
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            displayName: "Approve production deployment"
+            inputs:
+              notifyUsers: "product-team@company.com"
+              instructions: "Please review staging deployment and approve production deployment"
+
+  - stage: DeployProduction
+    displayName: "Deploy to Production"
+    dependsOn: ApprovalGate
+    condition: and(
+      succeeded(),
+      eq(variables['runDeployments'], 'true'),
+      ne(variables['azureServiceConnection'], ''),
+      ne(variables['azureServiceConnection'], 'replace-with-azure-service-connection')
+      )
+    jobs:
+      - job: DeployToProduction
+        displayName: "Deploy infrastructure and app to production"
+        steps:
+          - checkout: self
+            displayName: "Checkout code"
+
+          - task: AzureCLI@2
+            displayName: "Deploy production with Bicep and ACR build"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RESOURCE_GROUP="$(productionResourceGroup)"
+                LOCATION="$(azureLocation)"
+                APP_NAME="$(appName)"
+                IMAGE_REPOSITORY="$(acrImageRepository)"
+                IMAGE_TAG="$(tag)"
+                ENV_NAME="prod"
+                APP_SERVICE_NAME="${APP_NAME}-app-${ENV_NAME}"
+
+                az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+                az deployment group create \
+                  --resource-group "$RESOURCE_GROUP" \
+                  --template-file infrastructure/main.bicep \
+                  --parameters @infrastructure/parameters.prod.bicepparam \
+                  --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+                ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+                if [ -z "$ACR_NAME" ]; then
+                  echo "No Azure Container Registry found in $RESOURCE_GROUP"
+                  exit 1
+                fi
+
+                az acr build --registry "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" .
+
+                az deployment group create \
+                  --resource-group "$RESOURCE_GROUP" \
+                  --template-file infrastructure/main.bicep \
+                  --parameters @infrastructure/parameters.prod.bicepparam \
+                  --parameters appName="$APP_NAME" dockerImageUri="$IMAGE_REPOSITORY" dockerImageTag="$IMAGE_TAG"
+
+                APP_HOST=$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$APP_SERVICE_NAME" --query "defaultHostName" -o tsv)
+                curl --fail --silent --show-error "https://${APP_HOST}/health"
