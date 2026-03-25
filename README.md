@@ -1,4 +1,4 @@
-# azure-devops-python-cicd
+# flask-devops-lab
 
 Small Flask API project used to practice CI/CD and Azure deployment workflows.
 
